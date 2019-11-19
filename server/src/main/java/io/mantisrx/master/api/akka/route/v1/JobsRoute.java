@@ -24,6 +24,8 @@ import akka.http.javadsl.server.Route;
 import akka.http.javadsl.unmarshalling.StringUnmarshallers;
 import akka.japi.Pair;
 import com.google.common.base.Strings;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import io.mantisrx.master.api.akka.route.Jackson;
 import io.mantisrx.master.api.akka.route.handlers.JobClusterRouteHandler;
 import io.mantisrx.master.api.akka.route.handlers.JobRouteHandler;
@@ -38,6 +40,7 @@ import io.mantisrx.runtime.descriptor.StageScalingPolicy;
 import io.mantisrx.runtime.descriptor.StageSchedulingInfo;
 import io.mantisrx.server.core.PostJobStatusRequest;
 import io.mantisrx.server.master.config.ConfigurationProvider;
+import io.mantisrx.server.master.config.MasterConfiguration;
 import io.mantisrx.server.master.domain.DataFormatAdapter;
 import io.mantisrx.server.master.domain.JobId;
 import io.mantisrx.server.master.http.api.CompactJobInfo;
@@ -50,6 +53,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
 import static akka.http.javadsl.server.PathMatchers.segment;
@@ -82,12 +86,22 @@ public class JobsRoute extends BaseRoute {
 
     private final JobRouteHandler jobRouteHandler;
     private final JobClusterRouteHandler clusterRouteHandler;
+    private final MasterConfiguration config;
+
+    private final Cache<JobClusterManagerProto.ListJobsRequest, JobClusterManagerProto.ListJobsResponse> listJobsCache;
 
     public JobsRoute(
             final JobClusterRouteHandler clusterRouteHandler,
             final JobRouteHandler jobRouteHandler) {
         this.jobRouteHandler = jobRouteHandler;
         this.clusterRouteHandler = clusterRouteHandler;
+
+        config = ConfigurationProvider.getConfig();
+        listJobsCache = CacheBuilder
+                .newBuilder()
+                .maximumSize(config.getApiCacheMaxSize())
+                .expireAfterAccess(config.getApiCacheExpirySeconds(), TimeUnit.SECONDS)
+                .build();
     }
 
 
@@ -228,9 +242,17 @@ public class JobsRoute extends BaseRoute {
                                     clusterName.map(s -> Optional.of("^" + s + "$")).orElse(matching),
                                     true);
 
+                              JobClusterManagerProto.ListJobsResponse cachedResponse = listJobsCache.getIfPresent(listJobsRequest);
+
                               return completeAsync(
-                                    jobRouteHandler.listJobs(listJobsRequest),
-                                    resp -> completeOK(
+                                    cachedResponse == null ? jobRouteHandler.listJobs(listJobsRequest) : CompletableFuture.completedFuture(cachedResponse),
+                                    resp -> {
+
+                                        if (config.getApiCacheEnabled() && cachedResponse == null) {
+                                            listJobsCache.put(listJobsRequest, resp);
+                                        }
+
+                                        return completeOK(
                                             (isCompact.isPresent() && isCompact.get()) ?
                                                     resp.getJobList(
                                                             JobClusterProtoAdapter::toCompactJobInfo,
@@ -248,7 +270,8 @@ public class JobsRoute extends BaseRoute {
                                             Jackson.marshaller(
                                                     super.parseFilter(fields.orElse(null),
                                                             target.orElse(null)))
-                                    ),
+                                    );
+                                        },
                                     endpoint,
                                     HttpRequestMetrics.HttpVerb.GET
                             );
