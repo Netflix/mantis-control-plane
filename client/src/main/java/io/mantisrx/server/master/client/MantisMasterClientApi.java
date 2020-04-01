@@ -16,22 +16,6 @@
 
 package io.mantisrx.server.master.client;
 
-import java.io.IOException;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.nio.charset.Charset;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
-
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.DeserializationFeature;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import io.mantisrx.common.Label;
 import io.mantisrx.common.network.Endpoint;
 import io.mantisrx.runtime.JobSla;
@@ -41,20 +25,7 @@ import io.mantisrx.runtime.WorkerMigrationConfig;
 import io.mantisrx.runtime.codec.JsonCodec;
 import io.mantisrx.runtime.descriptor.SchedulingInfo;
 import io.mantisrx.runtime.parameter.Parameter;
-import io.mantisrx.server.core.JobAssignmentResult;
-import io.mantisrx.server.core.JobSchedulingInfo;
-import io.mantisrx.server.core.NamedJobInfo;
-import io.mantisrx.server.core.master.LocalMasterMonitor;
-import io.mantisrx.server.core.master.MasterDescription;
-import io.mantisrx.server.core.master.MasterMonitor;
-import io.netty.buffer.ByteBuf;
-import io.netty.handler.codec.http.HttpResponseStatus;
-import io.netty.handler.codec.http.HttpStatusClass;
-import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
-import io.reactivex.mantis.remote.observable.ConnectToObservable;
-import io.reactivex.mantis.remote.observable.DynamicConnectionSet;
-import io.reactivex.mantis.remote.observable.ToDeltaEndpointInjector;
-import io.reactivex.mantis.remote.observable.reconciliator.Reconciliator;
+
 import mantis.io.reactivex.netty.RxNetty;
 import mantis.io.reactivex.netty.channel.ObservableConnection;
 import mantis.io.reactivex.netty.pipeline.PipelineConfigurators;
@@ -63,14 +34,55 @@ import mantis.io.reactivex.netty.protocol.http.client.HttpClientRequest;
 import mantis.io.reactivex.netty.protocol.http.client.HttpClientResponse;
 import mantis.io.reactivex.netty.protocol.http.sse.ServerSentEvent;
 import mantis.io.reactivex.netty.protocol.http.websocket.WebSocketClient;
+
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+
+import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
+
+import io.netty.buffer.ByteBuf;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpStatusClass;
+import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
+
+import io.reactivex.mantis.remote.observable.ConnectToObservable;
+import io.reactivex.mantis.remote.observable.DynamicConnectionSet;
+import io.reactivex.mantis.remote.observable.ToDeltaEndpointInjector;
+import io.reactivex.mantis.remote.observable.reconciliator.Reconciliator;
+
+import java.io.IOException;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import rx.Observable;
 import rx.functions.Func1;
 import rx.functions.Func2;
+
+import io.mantisrx.server.core.JobAssignmentResult;
+import io.mantisrx.server.core.JobSchedulingInfo;
+import io.mantisrx.server.core.NamedJobInfo;
+import io.mantisrx.server.core.master.LocalMasterMonitor;
+import io.mantisrx.server.core.master.MasterDescription;
+import io.mantisrx.server.core.master.MasterMonitor;
 
 
 /**
@@ -646,12 +658,17 @@ public class MantisMasterClientApi {
                         .build();
     }
 
+
+    private final Map<String, Observable<String>> jobStatusCache = new ConcurrentHashMap<>();
+
     /**
-     *
-     * @param jobId
-     * @return
+     * 
+     * @param jobId The mantis job id for which to fetch job status updates.
+     * @return A cold-then-hot stream of job status updates for the provided job id.
      */
     public Observable<String> getJobStatusObservable(final String jobId) {
+      logger.info("Caching job status observable for jobId {}.", jobId);
+      return jobStatusCache.computeIfAbsent(jobId, (id) -> {
         return masterMonitor.getMasterObservable()
                 .filter((md) -> md != null)
                 .retryWhen(retryLogic)
@@ -660,8 +677,21 @@ public class MantisMasterClientApi {
                         .connect()
                         .flatMap((ObservableConnection<TextWebSocketFrame, TextWebSocketFrame> connection) -> connection.getInput()
                                 .map((TextWebSocketFrame webSocketFrame) -> webSocketFrame.text())))
-                .onErrorResumeNext(Observable.empty());
+                .onErrorResumeNext(Observable.empty())
+                .doOnCompleted(() -> {
+                  logger.info("Purging {} from job status cache", id);
+                  jobSchedulingInfoCache.remove(id);
+                })
+                .doOnUnsubscribe(() -> {
+                  logger.info("Purging {} from job status cache", id);
+                  jobSchedulingInfoCache.remove(id);
+                })
+                .replay(25)
+                .autoConnect();
+      });
     }
+
+    private final Map<String, Observable<JobSchedulingInfo>> jobSchedulingInfoCache = new ConcurrentHashMap<>();
 
     /**
      *
@@ -669,13 +699,15 @@ public class MantisMasterClientApi {
      * @return
      */
     public Observable<JobSchedulingInfo> schedulingChanges(final String jobId) {
+      logger.info("Caching scheduling change observable for jobId {}.", jobId);
+      return jobSchedulingInfoCache.computeIfAbsent(jobId, (id) -> {
         return masterMonitor.getMasterObservable()
                 .filter(masterDescription -> masterDescription != null)
                 .retryWhen(retryLogic)
                 .switchMap((Func1<MasterDescription,
                         Observable<JobSchedulingInfo>>) masterDescription -> getRxnettySseClient(
                                 masterDescription.getHostname(), masterDescription.getSchedInfoPort())
-                        .submit(HttpClientRequest.createGet("/assignmentresults/" + jobId + "?sendHB=true"))
+                        .submit(HttpClientRequest.createGet("/assignmentresults/" + id + "?sendHB=true"))
                         .flatMap((Func1<HttpClientResponse<ServerSentEvent>,
                                 Observable<JobSchedulingInfo>>) response -> {
                             if (!HttpResponseStatus.OK.equals(response.getStatus())) {
@@ -697,7 +729,17 @@ public class MantisMasterClientApi {
                         }))
                 .repeatWhen(repeatLogic)
                 .retryWhen(retryLogic)
-                ;
+                .doOnCompleted(() -> {
+                  logger.info("Purging {} from job scheudling info cache", id);
+                  jobSchedulingInfoCache.remove(id);
+                })
+                .doOnUnsubscribe(() -> {
+                  logger.info("Purging {} from job scheudling info cache", id);
+                  jobSchedulingInfoCache.remove(id);
+                })
+                .replay(1)
+                .autoConnect();
+      });
     }
 
     /**
