@@ -662,7 +662,9 @@ public class MantisMasterClientApi {
     private final Map<String, Observable<String>> jobStatusCache = new ConcurrentHashMap<>();
 
     /**
-     * 
+     * Provides the caller with a stream of status updates for the given jobId.
+     * Multiplexes calls by caching connections to reduce the load on the Mantis master.
+     *
      * @param jobId The mantis job id for which to fetch job status updates.
      * @return A cold-then-hot stream of job status updates for the provided job id.
      */
@@ -686,6 +688,10 @@ public class MantisMasterClientApi {
                   logger.info("Purging {} from job status cache", id);
                   jobSchedulingInfoCache.remove(id);
                 })
+                .doOnError((t) -> {
+                  logger.error("Purging {} from job status cache on error {}.", id, t.getMessage(), t);
+                  jobSchedulingInfoCache.remove(id);
+                })
                 .replay(25)
                 .autoConnect();
       });
@@ -694,9 +700,11 @@ public class MantisMasterClientApi {
     private final Map<String, Observable<JobSchedulingInfo>> jobSchedulingInfoCache = new ConcurrentHashMap<>();
 
     /**
+     * Provides the caller with a stream of scheduling updates for the given jobId.
+     * Multiplexes calls by caching connections to reduce the load on the Mantis master.
      *
-     * @param jobId
-     * @return
+     * @param jobIdThe mantis job id for which to fetch scheduling changes.
+     * @return A cold-then-hot stream of the most recent and any new scheduling updates.
      */
     public Observable<JobSchedulingInfo> schedulingChanges(final String jobId) {
       logger.info("Caching scheduling change observable for jobId {}.", jobId);
@@ -730,11 +738,15 @@ public class MantisMasterClientApi {
                 .repeatWhen(repeatLogic)
                 .retryWhen(retryLogic)
                 .doOnCompleted(() -> {
-                  logger.info("Purging {} from job scheudling info cache", id);
+                  logger.info("Purging {} from job scheduling info cache", id);
                   jobSchedulingInfoCache.remove(id);
                 })
                 .doOnUnsubscribe(() -> {
-                  logger.info("Purging {} from job scheudling info cache", id);
+                  logger.info("Purging {} from job scheduling info cache", id);
+                  jobSchedulingInfoCache.remove(id);
+                })
+                .doOnError((t) -> {
+                  logger.info("Purging {} from job scheduling info cache on error {}.", id, t.getMessage(), t);
                   jobSchedulingInfoCache.remove(id);
                 })
                 .replay(1)
